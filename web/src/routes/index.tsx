@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 export const Route = createFileRoute('/')({
   component: BillSplitterApp,
@@ -41,9 +41,8 @@ interface Balance {
   outstandingCents: number
 }
 
-function formatMoney(cents: number): string {
-  const dollars = (cents / 100).toFixed(2)
-  return `$${dollars} (${cents}¢)`
+function formatMoney(amount: number): string {
+  return `₹${amount.toLocaleString('en-IN')}`
 }
 
 function formatDate(isoString?: string | null): string {
@@ -87,6 +86,9 @@ function BillSplitterApp() {
   const [newBillTitle, setNewBillTitle] = useState<string>('')
   const [newBillCents, setNewBillCents] = useState<string>('')
 
+  // Memoized member ID -> Name map for O(1) share lookups during rendering
+  const memberNameMap = useMemo(() => new Map(members.map((m) => [m.id, m.name])), [members])
+
   // Fetch homes list
   const loadHomes = useCallback(async () => {
     setIsLoadingHomes(true)
@@ -123,9 +125,11 @@ function BillSplitterApp() {
       if (!billsRes.ok) throw new Error(`Could not load bills (${billsRes.status})`)
       if (!balancesRes.ok) throw new Error(`Could not load balances (${balancesRes.status})`)
 
-      const membersData = (await membersRes.json()) as { members: Member[] }
-      const billsData = (await billsRes.json()) as { bills: Bill[] }
-      const balancesData = (await balancesRes.json()) as { balances: Balance[] }
+      const [membersData, billsData, balancesData] = await Promise.all([
+        membersRes.json() as Promise<{ members: Member[] }>,
+        billsRes.json() as Promise<{ bills: Bill[] }>,
+        balancesRes.json() as Promise<{ balances: Balance[] }>,
+      ])
 
       setMembers(membersData.members || [])
       setBills(billsData.bills || [])
@@ -217,7 +221,9 @@ function BillSplitterApp() {
 
     const cents = Number.parseInt(newBillCents, 10)
     if (Number.isNaN(cents) || cents <= 0) {
-      setActionError('Total cents must be a positive integer (e.g. 1000 for $10.00)')
+      setActionError(
+        'Total amount must be a positive whole number in Rupees (e.g. 3000 for ₹3,000)',
+      )
       return
     }
 
@@ -273,6 +279,8 @@ function BillSplitterApp() {
 
       const data = (await res.json()) as {
         id?: string
+        memberId?: string
+        amountCents?: number
         paidAt?: string
         error?: string
       }
@@ -293,6 +301,19 @@ function BillSplitterApp() {
           }
         }),
       )
+
+      // Optimistically deduct the paid amount from member's balance immediately
+      if (data.memberId && typeof data.amountCents === 'number') {
+        const paidMemberId = data.memberId
+        const paidAmount = data.amountCents
+        setBalances((prevBalances) =>
+          prevBalances.map((bal) =>
+            bal.memberId === paidMemberId
+              ? { ...bal, outstandingCents: Math.max(0, bal.outstandingCents - paidAmount) }
+              : bal,
+          ),
+        )
+      }
 
       setActionSuccess('Share marked as paid')
 
@@ -505,7 +526,7 @@ function BillSplitterApp() {
                       >
                         {b.outstandingCents > 0
                           ? `Owes ${formatMoney(b.outstandingCents)}`
-                          : 'All settled ($0.00)'}
+                          : 'All settled (₹0)'}
                       </span>
                     </div>
                   ))}
@@ -561,7 +582,7 @@ function BillSplitterApp() {
                       marginBottom: 4,
                     }}
                   >
-                    Total Amount (in whole Cents)
+                    Total Amount (₹)
                   </label>
                   <input
                     id="bill-cents"
@@ -569,7 +590,7 @@ function BillSplitterApp() {
                     step="1"
                     min="1"
                     className="input-field"
-                    placeholder="e.g. 3000 for $30.00"
+                    placeholder="e.g. 3000 for ₹3,000"
                     value={newBillCents}
                     onChange={(e) => setNewBillCents(e.target.value)}
                     disabled={isCreatingBill}
@@ -586,11 +607,12 @@ function BillSplitterApp() {
                     marginBottom: 12,
                   }}
                 >
-                  💡 Split preview: {newBillCents}¢ divided across {members.length} member
+                  💡 Split preview: {formatMoney(Number(newBillCents))} divided across{' '}
+                  {members.length} member
                   {members.length > 1 ? 's' : ''} ≈{' '}
                   {formatMoney(Math.floor(Number(newBillCents) / members.length))} base per share.
                   {Number(newBillCents) % members.length > 0 &&
-                    ` (+1¢ extra to first ${Number(newBillCents) % members.length} member(s))`}
+                    ` (+₹1 extra to first ${Number(newBillCents) % members.length} member(s))`}
                 </p>
               )}
 
@@ -637,7 +659,10 @@ function BillSplitterApp() {
               </div>
             ) : (
               bills.map((bill) => {
-                const totalPaid = bill.shares.filter((s) => s.paidAt !== null).length
+                let totalPaid = 0
+                for (const s of bill.shares) {
+                  if (s.paidAt !== null) totalPaid++
+                }
                 const allPaid = totalPaid === bill.shares.length
 
                 return (
@@ -676,9 +701,7 @@ function BillSplitterApp() {
                           const isPaid = share.paidAt !== null
                           const isPaying = payingShareId === share.id
                           const memberName =
-                            share.memberName ||
-                            members.find((m) => m.id === share.memberId)?.name ||
-                            'Member'
+                            share.memberName || memberNameMap.get(share.memberId) || 'Member'
 
                           return (
                             <tr key={share.id}>

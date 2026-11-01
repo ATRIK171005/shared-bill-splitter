@@ -146,19 +146,17 @@ app.post('/api/homes/:homeId/bills', async (c) => {
     paidAt: null,
   }))
 
-  const statements: D1PreparedStatement[] = [
-    c.env.DB.prepare(
-      'INSERT INTO bills (id, home_id, title, total_cents, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).bind(billId, homeId, title.trim(), totalCents, createdAt),
-  ]
+  const insertBillStmt = c.env.DB.prepare(
+    'INSERT INTO bills (id, home_id, title, total_cents, created_at) VALUES (?, ?, ?, ?, ?)',
+  )
+  const insertShareStmt = c.env.DB.prepare(
+    'INSERT INTO bill_shares (id, bill_id, member_id, amount_cents, paid_at, idempotency_key, created_at) VALUES (?, ?, ?, ?, NULL, NULL, ?)',
+  )
 
-  for (const share of shares) {
-    statements.push(
-      c.env.DB.prepare(
-        'INSERT INTO bill_shares (id, bill_id, member_id, amount_cents, paid_at, idempotency_key, created_at) VALUES (?, ?, ?, ?, NULL, NULL, ?)',
-      ).bind(share.id, billId, share.memberId, share.amountCents, createdAt),
-    )
-  }
+  const statements: D1PreparedStatement[] = [
+    insertBillStmt.bind(billId, homeId, title.trim(), totalCents, createdAt),
+    ...shares.map((s) => insertShareStmt.bind(s.id, billId, s.memberId, s.amountCents, createdAt)),
+  ]
 
   await c.env.DB.batch(statements)
 
@@ -229,18 +227,19 @@ app.get('/api/homes/:homeId/bills', async (c) => {
   >()
 
   for (const share of allShares) {
-    let list = sharesByBill.get(share.billId)
-    if (!list) {
-      list = []
-      sharesByBill.set(share.billId, list)
-    }
-    list.push({
+    const item = {
       id: share.id,
       memberId: share.memberId,
       memberName: share.memberName,
       amountCents: share.amountCents,
       paidAt: share.paidAt,
-    })
+    }
+    const list = sharesByBill.get(share.billId)
+    if (list) {
+      list.push(item)
+    } else {
+      sharesByBill.set(share.billId, [item])
+    }
   }
 
   const billsWithShares = bills.map((bill) => ({
