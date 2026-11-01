@@ -97,19 +97,15 @@ function BillSplitterApp() {
         throw new Error(`Failed to load homes (Status ${res.status})`)
       }
       const data = (await res.json()) as { homes: Home[] }
-      setHomes(data.homes || [])
-      if (data.homes && data.homes.length > 0 && !selectedHomeId) {
-        const first = data.homes[0]
-        if (first) {
-          setSelectedHomeId(first.id)
-        }
-      }
+      const fetchedHomes = data.homes || []
+      setHomes(fetchedHomes)
+      setSelectedHomeId((curr) => curr || fetchedHomes[0]?.id || '')
     } catch (err) {
       setGlobalError(err instanceof Error ? err.message : 'Failed to connect to API server')
     } finally {
       setIsLoadingHomes(false)
     }
-  }, [selectedHomeId])
+  }, [])
 
   // Fetch home details (members, bills, balances)
   const loadHomeDetails = useCallback(async (homeId: string) => {

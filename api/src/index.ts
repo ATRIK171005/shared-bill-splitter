@@ -2,17 +2,31 @@ import { Hono } from 'hono'
 
 const app = new Hono<{ Bindings: Env }>()
 
+// ==========================================
+// Helpers & Types
+// ==========================================
+
+function isValidCents(val: unknown): val is number {
+  return typeof val === 'number' && Number.isInteger(val) && val > 0 && Number.isSafeInteger(val)
+}
+
+async function findHomeById(db: D1Database, homeId: string) {
+  return db
+    .prepare('SELECT id, name FROM homes WHERE id = ?')
+    .bind(homeId)
+    .first<{ id: string; name: string }>()
+}
+
+// ==========================================
+// Routes
+// ==========================================
+
 // Health check endpoint
 app.get('/api/health', (c) => c.json({ status: 'ok' }))
 
 // Create a new home
 app.post('/api/homes', async (c) => {
-  let body: { name?: unknown }
-  try {
-    body = await c.req.json()
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400)
-  }
+  const body = await c.req.json<{ name?: unknown }>().catch(() => null)
 
   if (typeof body?.name !== 'string' || !body.name.trim()) {
     return c.json({ error: 'Home name is required' }, 400)
@@ -41,9 +55,7 @@ app.get('/api/homes', async (c) => {
 // Get details of a single home including its members
 app.get('/api/homes/:homeId', async (c) => {
   const homeId = c.req.param('homeId')
-  const home = await c.env.DB.prepare('SELECT id, name FROM homes WHERE id = ?')
-    .bind(homeId)
-    .first<{ id: string; name: string }>()
+  const home = await findHomeById(c.env.DB, homeId)
 
   if (!home) {
     return c.json({ error: 'Home not found' }, 404)
@@ -61,19 +73,13 @@ app.get('/api/homes/:homeId', async (c) => {
 // Add a member to a home
 app.post('/api/homes/:homeId/members', async (c) => {
   const homeId = c.req.param('homeId')
-
-  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  const home = await findHomeById(c.env.DB, homeId)
 
   if (!home) {
     return c.json({ error: 'Home not found' }, 404)
   }
 
-  let body: { name?: unknown }
-  try {
-    body = await c.req.json()
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400)
-  }
+  const body = await c.req.json<{ name?: unknown }>().catch(() => null)
 
   if (typeof body?.name !== 'string' || !body.name.trim()) {
     return c.json({ error: 'Member name is required' }, 400)
@@ -93,28 +99,20 @@ app.post('/api/homes/:homeId/members', async (c) => {
 // Create and split a bill between home members
 app.post('/api/homes/:homeId/bills', async (c) => {
   const homeId = c.req.param('homeId')
-
-  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  const home = await findHomeById(c.env.DB, homeId)
 
   if (!home) {
     return c.json({ error: 'Home not found' }, 404)
   }
 
-  let body: { title?: unknown; totalCents?: unknown }
-  try {
-    body = await c.req.json()
-  } catch {
+  const body = await c.req.json<{ title?: unknown; totalCents?: unknown }>().catch(() => null)
+  if (!body) {
     return c.json({ error: 'Invalid JSON body' }, 422)
   }
 
   const { title, totalCents } = body
 
-  if (
-    typeof totalCents !== 'number' ||
-    !Number.isInteger(totalCents) ||
-    totalCents <= 0 ||
-    !Number.isSafeInteger(totalCents)
-  ) {
+  if (!isValidCents(totalCents)) {
     return c.json({ error: 'totalCents must be a positive whole integer' }, 422)
   }
 
@@ -140,16 +138,13 @@ app.post('/api/homes/:homeId/bills', async (c) => {
   const billId = crypto.randomUUID()
   const createdAt = new Date().toISOString()
 
-  const shares = members.map((member, index) => {
-    const extra = index < remainder ? 1 : 0
-    return {
-      id: crypto.randomUUID(),
-      billId,
-      memberId: member.id,
-      amountCents: baseAmount + extra,
-      paidAt: null,
-    }
-  })
+  const shares = members.map((member, index) => ({
+    id: crypto.randomUUID(),
+    billId,
+    memberId: member.id,
+    amountCents: baseAmount + (index < remainder ? 1 : 0),
+    paidAt: null,
+  }))
 
   const statements: D1PreparedStatement[] = [
     c.env.DB.prepare(
@@ -187,36 +182,40 @@ app.post('/api/homes/:homeId/bills', async (c) => {
 // Get bills of a home with all member shares
 app.get('/api/homes/:homeId/bills', async (c) => {
   const homeId = c.req.param('homeId')
-
-  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  const home = await findHomeById(c.env.DB, homeId)
 
   if (!home) {
     return c.json({ error: 'Home not found' }, 404)
   }
 
-  const { results: bills } = await c.env.DB.prepare(
-    'SELECT id, home_id as homeId, title, total_cents as totalCents, created_at as createdAt FROM bills WHERE home_id = ? ORDER BY rowid DESC',
-  )
-    .bind(homeId)
-    .all<{ id: string; homeId: string; title: string; totalCents: number; createdAt: string }>()
+  // Concurrently fetch bills and their shares to minimize latency
+  const [billsQuery, sharesQuery] = await Promise.all([
+    c.env.DB.prepare(
+      'SELECT id, home_id as homeId, title, total_cents as totalCents, created_at as createdAt FROM bills WHERE home_id = ? ORDER BY rowid DESC',
+    )
+      .bind(homeId)
+      .all<{ id: string; homeId: string; title: string; totalCents: number; createdAt: string }>(),
+    c.env.DB.prepare(
+      `SELECT s.id, s.bill_id as billId, s.member_id as memberId, m.name as memberName, s.amount_cents as amountCents, s.paid_at as paidAt
+       FROM bill_shares s
+       JOIN members m ON m.id = s.member_id
+       JOIN bills b ON b.id = s.bill_id
+       WHERE b.home_id = ?
+       ORDER BY m.rowid ASC`,
+    )
+      .bind(homeId)
+      .all<{
+        id: string
+        billId: string
+        memberId: string
+        memberName: string
+        amountCents: number
+        paidAt: string | null
+      }>(),
+  ])
 
-  const { results: allShares } = await c.env.DB.prepare(
-    `SELECT s.id, s.bill_id as billId, s.member_id as memberId, m.name as memberName, s.amount_cents as amountCents, s.paid_at as paidAt
-     FROM bill_shares s
-     JOIN members m ON m.id = s.member_id
-     JOIN bills b ON b.id = s.bill_id
-     WHERE b.home_id = ?
-     ORDER BY m.rowid ASC`,
-  )
-    .bind(homeId)
-    .all<{
-      id: string
-      billId: string
-      memberId: string
-      memberName: string
-      amountCents: number
-      paidAt: string | null
-    }>()
+  const bills = billsQuery.results
+  const allShares = sharesQuery.results
 
   const sharesByBill = new Map<
     string,
@@ -230,7 +229,11 @@ app.get('/api/homes/:homeId/bills', async (c) => {
   >()
 
   for (const share of allShares) {
-    const list = sharesByBill.get(share.billId) || []
+    let list = sharesByBill.get(share.billId)
+    if (!list) {
+      list = []
+      sharesByBill.set(share.billId, list)
+    }
     list.push({
       id: share.id,
       memberId: share.memberId,
@@ -238,7 +241,6 @@ app.get('/api/homes/:homeId/bills', async (c) => {
       amountCents: share.amountCents,
       paidAt: share.paidAt,
     })
-    sharesByBill.set(share.billId, list)
   }
 
   const billsWithShares = bills.map((bill) => ({
@@ -264,38 +266,46 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
   const billId = c.req.param('billId')
   const shareId = c.req.param('shareId')
 
-  const bill = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(billId).first()
-
-  if (!bill) {
-    return c.json({ error: 'Bill not found' }, 404)
-  }
-
-  const share = await c.env.DB.prepare(
-    'SELECT id, bill_id as billId, member_id as memberId, amount_cents as amountCents, paid_at as paidAt, idempotency_key as idempotencyKey FROM bill_shares WHERE id = ? AND bill_id = ?',
+  // Verify bill and share existence in a single join query
+  const row = await c.env.DB.prepare(
+    `SELECT 
+       b.id AS bill_id,
+       s.id AS share_id,
+       s.member_id AS member_id,
+       s.amount_cents AS amount_cents,
+       s.paid_at AS paid_at,
+       s.idempotency_key AS idempotency_key
+     FROM bills b
+     LEFT JOIN bill_shares s ON s.id = ? AND s.bill_id = b.id
+     WHERE b.id = ?`,
   )
     .bind(shareId, billId)
     .first<{
-      id: string
-      billId: string
-      memberId: string
-      amountCents: number
-      paidAt: string | null
-      idempotencyKey: string | null
+      bill_id: string
+      share_id: string | null
+      member_id: string | null
+      amount_cents: number | null
+      paid_at: string | null
+      idempotency_key: string | null
     }>()
 
-  if (!share) {
+  if (!row) {
+    return c.json({ error: 'Bill not found' }, 404)
+  }
+
+  if (!row.share_id || row.member_id === null || row.amount_cents === null) {
     return c.json({ error: 'Share not found' }, 404)
   }
 
   // Already paid? Check idempotency key
-  if (share.paidAt !== null) {
-    if (share.idempotencyKey === trimmedKey) {
+  if (row.paid_at !== null) {
+    if (row.idempotency_key === trimmedKey) {
       return c.json(
         {
-          id: share.id,
-          memberId: share.memberId,
-          amountCents: share.amountCents,
-          paidAt: share.paidAt,
+          id: row.share_id,
+          memberId: row.member_id,
+          amountCents: row.amount_cents,
+          paidAt: row.paid_at,
         },
         200,
       )
@@ -303,7 +313,7 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
     return c.json({ error: 'Share already paid with a different key' }, 409)
   }
 
-  // Attempt atomic payment
+  // Attempt atomic payment update
   const paidAt = new Date().toISOString()
   const updateResult = await c.env.DB.prepare(
     'UPDATE bill_shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL',
@@ -314,16 +324,16 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
   if (updateResult.meta.changes === 1) {
     return c.json(
       {
-        id: share.id,
-        memberId: share.memberId,
-        amountCents: share.amountCents,
+        id: row.share_id,
+        memberId: row.member_id,
+        amountCents: row.amount_cents,
         paidAt,
       },
       200,
     )
   }
 
-  // If update affected 0 rows, another concurrent request paid it
+  // If update affected 0 rows, another concurrent request paid it first
   const freshShare = await c.env.DB.prepare(
     'SELECT id, member_id as memberId, amount_cents as amountCents, paid_at as paidAt, idempotency_key as idempotencyKey FROM bill_shares WHERE id = ?',
   )
@@ -354,8 +364,7 @@ app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
 // Outstanding balances for members of a home
 app.get('/api/homes/:homeId/balances', async (c) => {
   const homeId = c.req.param('homeId')
-
-  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?').bind(homeId).first()
+  const home = await findHomeById(c.env.DB, homeId)
 
   if (!home) {
     return c.json({ error: 'Home not found' }, 404)
