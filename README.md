@@ -155,3 +155,26 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Storage-Level Atomic Idempotency Pattern
+
+For share payment, instead of managing a separate idempotency log table or attempting distributed locking across stateless Worker isolates, we stored `paid_at` and `idempotency_key` directly on the `bill_shares` record and executed an atomic conditional write:
+```sql
+UPDATE bill_shares
+SET paid_at = ?, idempotency_key = ?
+WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+```
+
+- **Why:** SQLite transactions are serialized. If two requests race to pay the same share concurrently, exactly one will modify 1 row and succeed. The runner-up sees 0 changes and queries the recorded share: if the `idempotency_key` matches, it returns `200` with the existing payment; if a different key was used, it cleanly answers `409 Conflict`. This guarantees idempotency and race safety without external coordination overhead.
+
+### 2. Deterministic Member Ordering via SQLite `rowid`
+
+The assignment requires that remainder cents from uneven splits and outstanding balances follow the exact order in which members were added to the home.
+- **Why:** Storing timestamps with `ISO 8601` strings can risk millisecond collisions in automated test runners or high-frequency batch requests. Standard SQLite tables have an auto-incrementing 64-bit `rowid`. By querying `ORDER BY m.rowid ASC`, we guarantee strictly monotonic, deterministic member order that mirrors insertion sequence regardless of system clock precision.
+
+### 3. Whole-Cent Data Pipeline & Defensive Web Resilience
+
+All internal representations, API payloads, and database columns strictly handle whole integer cents (`total_cents`, `amount_cents`, `outstanding_cents`). Fractional dollar amounts are only formatted at the presentation layer for display (`formatMoney`).
+- **Why:** JavaScript `Number` floating-point arithmetic can introduce rounding errors (e.g., `0.1 + 0.2 !== 0.3`). Handling all arithmetic in cents ensures split remainder calculations (`totalCents % n`) and balance aggregations (`SUM(amount_cents)`) are mathematically exact. In the frontend, asynchronous operations are isolated with per-share loading states, all API interactions are safeguarded within `try...catch` blocks, and top-level rendering is wrapped in a React `ErrorBoundary` so server lag, 500 responses, or network disruptions never crash the interface.
